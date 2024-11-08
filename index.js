@@ -4,8 +4,12 @@ const bcrypt = require('bcryptjs')
 const jwt = require('jsonwebtoken')
 const {authenticator} = require('otplib')
 const qrcode = require('qrcode')
+const crypto = require('crypto')
+const NodeCache = require('node-cache')
+
 const config = require('./config')
 const app = express()
+const cache = new NodeCache()
 app.use(express.json())
 const users = Datastore.create("Users.db")
 const refreshTokens = Datastore.create("Tokens.db")
@@ -62,6 +66,57 @@ app.post('/api/auth/login', async (req,res)=>{
             return res.status(401).json({message:"Invalid email or password"})
         }
 
+        if(user['2faEnable']){
+            const tempToken = crypto.randomUUID()
+            cache.set(config.cacheTemporaryTokenPrefix+tempToken,user._id,config.cacheTemporaryTokenExpiresInSeconds)
+            return res.status(200).json({tempToken,expiresInSeconds:config.cacheTemporaryTokenExpiresInSeconds})
+
+        }
+        else{
+            const accessToken =  jwt.sign({userId:user._id},config.accessTokenSecret,{subject:"accessApi" , expiresIn:config.accessTokenExpiresIn})
+
+
+        const refreshToken = jwt.sign({userId:user._id} , config.refreshTokenSecret ,{subject:"refreshApi" , expiresIn:config.refreshTokenExpiresIn})
+        await refreshTokens.insert({
+            refreshToken,
+            userId:user._id
+        })
+        return res.status(200).json({
+            id:user._id,
+            name:user.name,
+            email:user.email,
+            accessToken,
+            refreshToken
+            
+        })
+        }
+
+        
+
+    }catch(error){
+        return res.status(500).json({message:error.message})
+    }
+})
+
+app.post('/api/auth/login/2fa',async(req,res)=>{
+    try{
+        const {tempToken , totp}  = req.body
+        if(!tempToken || !totp){
+            return res.status(422).json({message:"All fields are mandatory"})
+        }
+        const userId = cache.get(config.cacheTemporaryTokenPrefix+tempToken)   
+
+        if(!userId){
+            return res.status(401).json({message:"The provided temporary token is incorrect or expired"})
+        }
+        const user = await users.findOne({_id:userId})
+
+        const verified = authenticator.check(totp,user['2faSecret'])
+
+        if(!verified){
+            return res.status(401).json({message:"Provided totp is incorrect or expired"})
+        }
+
         const accessToken =  jwt.sign({userId:user._id},config.accessTokenSecret,{subject:"accessApi" , expiresIn:config.accessTokenExpiresIn})
 
 
@@ -82,6 +137,7 @@ app.post('/api/auth/login', async (req,res)=>{
     }catch(error){
         return res.status(500).json({message:error.message})
     }
+
 })
 
 app.post('/api/auth/refreshvalidate', async (req,res)=>{
@@ -163,7 +219,7 @@ app.post('/api/auth/2fa/validate',ensureAuthentication,async (req,res)=>{
             return res.status(400).json({message:"invalid or expired totp"})
         }
 
-        await users.update({_id:req.user.id},{$set:{ '2faEnale':true}})
+        await users.update({_id:req.user.id},{$set:{ '2faEnable':true}})
         await users.compactDatafile()
 
         return res.status(200).json({message:"Validated OTP"})
